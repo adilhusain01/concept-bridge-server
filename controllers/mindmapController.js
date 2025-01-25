@@ -203,18 +203,20 @@
 // };
 
 const OpenAI = require("openai");
-const openai = new OpenAI({
-  baseURL: "https://api.deepseek.com",
-  apiKey: process.env.DEEPSEEK_API_KEY,
-});
 const Mindmap = require("../models/Mindmap");
 const ClickedNode = require("../models/ClickedNode");
 const UserActivity = require("../models/UserActivity");
 
+// Initialize DeepSeek client
+const openai = new OpenAI({
+  baseURL: "https://api.deepseek.com",
+  apiKey: process.env.DEEPSEEK_API_KEY,
+});
+
 const cleanMermaidCode = (text) => {
   return text
     .replace(/```mermaid\n?/g, "")
-    .replace(/```\s*\$/g, "")
+    .replace(/```\s*$/g, "")
     .trim();
 };
 
@@ -222,6 +224,7 @@ exports.generateMindmap = async (req, res) => {
   try {
     const { topic, walletAddress } = req.body;
 
+    // Check if mindmap already exists for this topic and wallet
     const existingMindmap = await Mindmap.findOne({
       walletAddress: walletAddress.toLowerCase(),
       topic,
@@ -234,7 +237,7 @@ exports.generateMindmap = async (req, res) => {
       });
     }
 
-    const prompt = `Given the topic "\${topic}", create a Mermaid mindmap diagram showing the main concepts and their relationships.
+    const prompt = `Given the topic "${topic}", create a Mermaid mindmap diagram showing the main concepts and their relationships.
     The diagram should have:
     1. A clear hierarchy of topics and subtopics
     2. Meaningful connections between related concepts
@@ -244,19 +247,21 @@ exports.generateMindmap = async (req, res) => {
     Respond with ONLY the Mermaid mindmap code between triple backticks with 'mermaid' tag.`;
 
     const completion = await openai.chat.completions.create({
+      model: "deepseek-chat",
       messages: [
         {
           role: "system",
           content:
-            "You are a helpful assistant specialized in creating mindmaps.",
+            "You are an expert at creating structured mind maps using Mermaid notation.",
         },
         { role: "user", content: prompt },
       ],
-      model: "deepseek-chat",
     });
 
-    const cleanedCode = cleanMermaidCode(completion.choices[0].message.content);
+    const response = completion.choices[0].message.content;
+    const cleanedCode = cleanMermaidCode(response);
 
+    // Save the new mindmap
     const mindmap = new Mindmap({
       walletAddress: walletAddress.toLowerCase(),
       topic,
@@ -271,11 +276,23 @@ exports.generateMindmap = async (req, res) => {
   }
 };
 
+const cleanExplanation = (explanation) => {
+  const sections = explanation
+    .split("\n")
+    .filter((section) => section.trim() !== "");
+  return {
+    briefExplanation: sections[0] || "",
+    example: sections[1] || "",
+    keyTakeaway: sections[2] || "",
+  };
+};
+
 exports.getNodeInfo = async (req, res) => {
   try {
     const { nodeText, parentContext, walletAddress } = req.body;
 
-    const prompt = `Given the concept "\${nodeText}" in the context of "\${parentContext}", provide:
+    // Generate explanation using DeepSeek
+    const prompt = `Given the concept "${nodeText}" in the context of "${parentContext}", provide:
     1. A brief explanation (2-3 sentences)
     2. One concrete example that you explain someone like he is a child
     3. Key takeaway
@@ -283,26 +300,26 @@ exports.getNodeInfo = async (req, res) => {
     Keep the response concise and focused plus dont include heading for all three point at their start and separate them with a new line.`;
 
     const completion = await openai.chat.completions.create({
+      model: "deepseek-chat",
       messages: [
         {
           role: "system",
           content:
-            "You are a helpful assistant specialized in explaining concepts clearly.",
+            "You are an expert at providing clear, concise explanations of complex topics.",
         },
         { role: "user", content: prompt },
       ],
-      model: "deepseek-chat",
     });
 
-    const cleanedExplanation = cleanExplanation(
-      completion.choices[0].message.content
-    );
+    const response = completion.choices[0].message.content;
+    const cleanedExplanation = cleanExplanation(response);
 
     // Track user activity
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
     try {
+      // Try to update existing record for today
       const updatedActivity = await UserActivity.findOneAndUpdate(
         {
           walletAddress: walletAddress.toLowerCase(),
@@ -312,6 +329,7 @@ exports.getNodeInfo = async (req, res) => {
         { new: true }
       );
 
+      // If no existing record, create new one
       if (!updatedActivity) {
         await UserActivity.create({
           walletAddress: walletAddress.toLowerCase(),
@@ -320,11 +338,95 @@ exports.getNodeInfo = async (req, res) => {
       }
     } catch (activityError) {
       console.error("Error tracking user activity:", activityError);
+      // Continue with response even if activity tracking fails
     }
 
     res.json({ explanation: cleanedExplanation });
   } catch (error) {
     console.error("Error getting node info:", error);
     res.status(500).json({ error: "Failed to get node information" });
+  }
+};
+
+exports.getUserMindmaps = async (req, res) => {
+  try {
+    const { walletAddress } = req.params;
+    const mindmaps = await Mindmap.find({
+      walletAddress: walletAddress.toLowerCase(),
+    })
+      .select("topic createdAt")
+      .sort("-createdAt");
+
+    res.json(mindmaps);
+  } catch (error) {
+    console.error("Error fetching user mindmaps:", error);
+    res.status(500).json({ error: "Failed to fetch mindmaps" });
+  }
+};
+
+exports.getMindmapByTopic = async (req, res) => {
+  try {
+    const { walletAddress, topic } = req.params;
+    const mindmap = await Mindmap.findOne({
+      walletAddress: walletAddress.toLowerCase(),
+      topic,
+    });
+
+    if (!mindmap) {
+      return res.status(404).json({ error: "Mindmap not found" });
+    }
+
+    res.json(mindmap);
+  } catch (error) {
+    console.error("Error fetching mindmap:", error);
+    res.status(500).json({ error: "Failed to fetch mindmap" });
+  }
+};
+
+exports.trackNodeClick = async (req, res) => {
+  try {
+    const { walletAddress, topic, nodeText } = req.body;
+    const clickedNode = new ClickedNode({
+      walletAddress,
+      topic,
+      nodeText,
+    });
+    await clickedNode.save();
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getClickedNodes = async (req, res) => {
+  try {
+    const { walletAddress, topic } = req.params;
+    const clickedNodes = await ClickedNode.find({ walletAddress, topic });
+    res.status(200).json(clickedNodes);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.deleteMindmap = async (req, res) => {
+  try {
+    const { walletAddress, topic } = req.params;
+
+    // Delete the mindmap
+    await Mindmap.findOneAndDelete({
+      walletAddress: walletAddress.toLowerCase(),
+      topic,
+    });
+
+    // Delete all related clicked nodes
+    await ClickedNode.deleteMany({
+      walletAddress: walletAddress.toLowerCase(),
+      topic,
+    });
+
+    res.status(200).json({ success: true });
+  } catch (error) {
+    console.error("Error deleting mindmap:", error);
+    res.status(500).json({ error: "Failed to delete mindmap" });
   }
 };
